@@ -1,485 +1,565 @@
 # app.py
 import os
-import re
 import json
+import sqlite3
 import datetime as dt
-from typing import Optional, Tuple, Dict, Any, List
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, List, Tuple
 
-import requests
 import pandas as pd
 import streamlit as st
 
-# -----------------------------
+# =========================
 # Page config
-# -----------------------------
-st.set_page_config(page_title="AI 습관 트래커", page_icon="📊", layout="wide")
+# =========================
+st.set_page_config(page_title="AI 농구 코칭 대시보드", page_icon="🏀", layout="wide")
+st.title("🏀 AI 농구 코칭 대시보드")
+st.caption("코치/선수/부모 모드 · 훈련 로그 · 영상 분석 노트 · AI 피드백 · 리포트/내보내기")
 
-st.title("📊 AI 습관 트래커")
-st.caption("오늘의 체크인 → 7일 트렌드 → AI 코치 리포트까지 한 번에 🧠")
-
-# -----------------------------
-# Sidebar: API keys
-# -----------------------------
+# =========================
+# Sidebar: Settings / API
+# =========================
 with st.sidebar:
-    st.header("🔑 API 설정")
-    openai_api_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
-    owm_api_key = st.text_input("OpenWeatherMap API Key", type="password", placeholder="OWM Key...")
+    st.header("⚙️ 설정")
+    app_mode = st.radio("모드 선택", ["코치", "선수", "부모"], horizontal=True)
     st.divider()
-    st.caption("Tip: 키는 브라우저에만 입력되고 세션 동안만 사용돼요. (배포 시엔 Secrets 권장)")
+    openai_api_key = st.text_input("OpenAI API Key (선택)", type="password", placeholder="sk-...")
+    st.caption("AI 피드백 기능 사용 시 필요. 없으면 앱은 기록 중심으로만 동작해요.")
 
-# -----------------------------
-# Helpers: external APIs
-# -----------------------------
-def get_weather(city: str, api_key: str) -> Optional[Dict[str, Any]]:
-    """
-    OpenWeatherMap 현재 날씨 (한국어, 섭씨).
-    실패 시 None 반환. timeout=10
-    """
-    if not api_key:
-        return None
-    try:
-        url = "https://api.openweathermap.org/data/2.5/weather"
-        params = {
-            "q": city,
-            "appid": api_key,
-            "units": "metric",
-            "lang": "kr",
-        }
-        r = requests.get(url, params=params, timeout=10)
-        if r.status_code != 200:
-            return None
-        data = r.json()
+# =========================
+# DB (SQLite)
+# =========================
+DB_PATH = "coach_app.db"
 
-        weather = (data.get("weather") or [{}])[0]
-        main = data.get("main") or {}
-        wind = data.get("wind") or {}
-        sys_ = data.get("sys") or {}
+def db_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
 
-        icon = weather.get("icon")
-        icon_url = f"https://openweathermap.org/img/wn/{icon}@2x.png" if icon else None
+def db_init():
+    conn = db_conn()
+    cur = conn.cursor()
 
-        return {
-            "city": data.get("name") or city,
-            "country": sys_.get("country"),
-            "desc": weather.get("description"),
-            "temp": main.get("temp"),
-            "feels_like": main.get("feels_like"),
-            "humidity": main.get("humidity"),
-            "wind_speed": wind.get("speed"),
-            "icon_url": icon_url,
-        }
-    except Exception:
-        return None
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS players (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        grade TEXT,
+        position TEXT,
+        notes TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_date TEXT NOT NULL,
+        team TEXT,
+        title TEXT,
+        duration_min INTEGER,
+        focus TEXT,
+        plan_json TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
 
-def _breed_from_dog_url(url: str) -> Optional[str]:
-    """
-    Dog CEO 이미지 URL에서 품종 추출:
-    예) https://images.dog.ceo/breeds/hound-afghan/n02088094_1003.jpg -> hound (afghan)
-    """
-    try:
-        m = re.search(r"/breeds/([^/]+)/", url)
-        if not m:
-            return None
-        raw = m.group(1)  # e.g. hound-afghan
-        parts = raw.split("-")
-        if len(parts) == 1:
-            return parts[0]
-        # Dog CEO는 보통 breed-subbreed 형태
-        breed = parts[0]
-        sub = " ".join(parts[1:])
-        return f"{breed} ({sub})"
-    except Exception:
-        return None
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS attendance (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id INTEGER NOT NULL,
+        player_id INTEGER NOT NULL,
+        present INTEGER NOT NULL,
+        intensity INTEGER,
+        mood INTEGER,
+        memo TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(session_id, player_id),
+        FOREIGN KEY(session_id) REFERENCES sessions(id),
+        FOREIGN KEY(player_id) REFERENCES players(id)
+    )
+    """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS video_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        note_date TEXT NOT NULL,
+        game TEXT,
+        team TEXT,
+        quarter TEXT,
+        timestamp TEXT,
+        category TEXT,
+        players TEXT,
+        note TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
 
-def get_dog_image() -> Optional[Tuple[str, Optional[str]]]:
-    """
-    Dog CEO 랜덤 강아지 사진 URL과 품종 반환.
-    실패 시 None 반환. timeout=10
-    """
-    try:
-        url = "https://dog.ceo/api/breeds/image/random"
-        r = requests.get(url, timeout=10)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if data.get("status") != "success":
-            return None
-        img_url = data.get("message")
-        if not img_url:
-            return None
-        breed = _breed_from_dog_url(img_url)
-        return img_url, breed
-    except Exception:
-        return None
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        metric_date TEXT NOT NULL,
+        metric_type TEXT NOT NULL,
+        player TEXT NOT NULL,
+        made INTEGER,
+        attempt INTEGER,
+        percent REAL,
+        grade TEXT,
+        memo TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS parent_msgs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        msg_date TEXT NOT NULL,
+        player TEXT NOT NULL,
+        from_who TEXT,
+        message TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
 
-# -----------------------------
-# OpenAI: generate report
-# -----------------------------
-SYSTEM_PROMPTS = {
-    "스파르타 코치": (
-        "너는 '스파르타 코치'다. 말은 짧고 단호하게. 핑계는 잘라내고, 실행 가능한 지시만 준다. "
-        "그래도 인신공격은 금지. 데이터 기반으로 딱딱 정리한다."
-    ),
-    "따뜻한 멘토": (
-        "너는 '따뜻한 멘토'다. 공감은 하되 과장하지 말고, 현실적인 칭찬과 다음 행동을 부드럽게 제안한다. "
-        "문장은 너무 길지 않게, 읽기 쉽게."
-    ),
-    "게임 마스터": (
-        "너는 '게임 마스터'다. 사용자의 하루를 RPG 퀘스트 로그처럼 연출한다. "
-        "진짜 게임 규칙을 만들 필요는 없고, 톤만 모험/레벨업 느낌으로. 유치하지 않게."
-    ),
-}
+    conn.commit()
+    conn.close()
 
-OUTPUT_FORMAT_RULES = """
-반드시 아래 출력 형식(섹션 제목 포함)을 지켜서 한국어로 작성해라.
+db_init()
 
-[컨디션 등급] S/A/B/C/D 중 하나 (한 줄)
-[습관 분석] 체크된 습관/비어있는 습관을 근거로 3~5줄
-[날씨 코멘트] 오늘 날씨를 반영해 1~2줄
-[내일 미션] 구체적인 행동 3개(불릿)
-[오늘의 한마디] 한 줄 (짧게, 기억에 남게)
-""".strip()
+# =========================
+# Utility
+# =========================
+def now_iso():
+    return dt.datetime.now().isoformat(timespec="seconds")
 
+def query_df(sql: str, params: Tuple = ()):
+    conn = db_conn()
+    df = pd.read_sql_query(sql, conn, params=params)
+    conn.close()
+    return df
 
-def _extract_text_from_responses_api(resp: Any) -> str:
-    """
-    Responses API 응답에서 텍스트를 최대한 안전하게 추출.
-    """
-    # 1) 공식 속성 (있는 경우)
-    text = getattr(resp, "output_text", None)
-    if isinstance(text, str) and text.strip():
-        return text.strip()
+def exec_sql(sql: str, params: Tuple = ()):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    conn.commit()
+    conn.close()
 
-    # 2) dict-like
-    try:
-        if isinstance(resp, dict):
-            # output_text
-            t = resp.get("output_text")
-            if isinstance(t, str) and t.strip():
-                return t.strip()
-            # output items 탐색
-            out = resp.get("output") or []
-            chunks = []
-            for item in out:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") == "message":
-                    content = item.get("content") or []
-                    for c in content:
-                        if isinstance(c, dict) and c.get("type") in ("output_text", "text"):
-                            if isinstance(c.get("text"), str):
-                                chunks.append(c["text"])
-            if chunks:
-                return "\n".join(chunks).strip()
-    except Exception:
-        pass
+def exec_sql_return_id(sql: str, params: Tuple = ()):
+    conn = db_conn()
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    conn.commit()
+    rid = cur.lastrowid
+    conn.close()
+    return rid
 
-    # 3) 객체 탐색
-    try:
-        out = getattr(resp, "output", None)
-        if out:
-            chunks = []
-            for item in out:
-                itype = getattr(item, "type", None)
-                if itype == "message":
-                    content = getattr(item, "content", None) or []
-                    for c in content:
-                        ctype = getattr(c, "type", None)
-                        if ctype in ("output_text", "text"):
-                            t = getattr(c, "text", None)
-                            if isinstance(t, str) and t.strip():
-                                chunks.append(t)
-            if chunks:
-                return "\n".join(chunks).strip()
-    except Exception:
-        pass
+def grade_by_percent(p: float, scheme: str = "rebound_total") -> str:
+    # 너가 자주 쓰던 등급 체계(리바운드 토탈용 등) 기반으로 두 가지 제공
+    if scheme == "rebound_total":
+        # 85%+ A, 75-84 B, 65-74 C, 55-64 D, 54 and down F
+        if p >= 85: return "A"
+        if p >= 75: return "B"
+        if p >= 65: return "C"
+        if p >= 55: return "D"
+        return "F"
+    else:
+        # alt: 82%+ A, 72-81 B, 62-71 C, 52-61 D, else F
+        if p >= 82: return "A"
+        if p >= 72: return "B"
+        if p >= 62: return "C"
+        if p >= 52: return "D"
+        return "F"
 
-    return ""
-
-
-def generate_report(
-    openai_key: str,
-    coach_style: str,
-    habits: Dict[str, bool],
-    mood: int,
-    weather: Optional[Dict[str, Any]],
-    dog_breed: Optional[str],
-) -> Optional[str]:
-    """
-    습관+기분+날씨+강아지 품종을 모아서 OpenAI에 전달.
-    모델: gpt-5-mini
-    실패 시 None.
-    """
+# =========================
+# AI helper (optional)
+# =========================
+def ai_feedback(openai_key: str, payload: Dict[str, Any], tone: str = "coach") -> Optional[str]:
     if not openai_key:
         return None
-
-    checked = [k for k, v in habits.items() if v]
-    unchecked = [k for k, v in habits.items() if not v]
-
-    weather_text = "날씨 정보 없음"
-    if weather:
-        weather_text = (
-            f"{weather.get('city')} / {weather.get('desc')} / "
-            f"{weather.get('temp')}°C(체감 {weather.get('feels_like')}°C) / 습도 {weather.get('humidity')}%"
-        )
-
-    dog_text = dog_breed or "알 수 없음"
-
-    user_payload = {
-        "date": str(dt.date.today()),
-        "mood_1_to_10": mood,
-        "checked_habits": checked,
-        "unchecked_habits": unchecked,
-        "weather": weather_text,
-        "dog_breed": dog_text,
-        "instruction": OUTPUT_FORMAT_RULES,
-    }
-
-    system = SYSTEM_PROMPTS.get(coach_style, SYSTEM_PROMPTS["따뜻한 멘토"])
-
     try:
-        # OpenAI Python SDK (Responses API)
         from openai import OpenAI  # type: ignore
-
         client = OpenAI(api_key=openai_key)
+
+        if tone == "coach":
+            system = "너는 농구 코치 겸 데이터 분석가다. 말은 짧고 명확하게. 실행 가능한 피드백 중심."
+        elif tone == "player":
+            system = "너는 선수 멘탈/루틴 코치다. 동기부여는 하되 과장하지 말고 구체적으로."
+        else:
+            system = "너는 학부모 상담 코치다. 공손하고 명확하게. 아이의 성장 포인트와 가정에서 할 과제를 제안."
+
+        format_rule = """
+한국어로 아래 형식 고정:
+[핵심 요약] 2줄
+[잘한 점] 불릿 3개
+[보완 포인트] 불릿 3개
+[다음 훈련 미션] 불릿 3개
+[코치 한마디] 1줄
+""".strip()
 
         resp = client.responses.create(
             model="gpt-5-mini",
             input=[
                 {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": (
-                        "아래 데이터를 보고 'AI 코치 리포트'를 작성해줘.\n"
-                        "데이터(JSON):\n"
-                        f"{json.dumps(user_payload, ensure_ascii=False, indent=2)}\n\n"
-                        "형식은 반드시 지켜."
-                    ),
-                },
+                {"role": "user", "content": "아래 데이터를 바탕으로 피드백을 작성해줘.\n"
+                                            f"데이터(JSON):\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
+                                            f"{format_rule}"}
             ],
             text={"verbosity": "medium"},
         )
-
-        text = _extract_text_from_responses_api(resp)
-        return text if text else None
-
+        text = getattr(resp, "output_text", "") or ""
+        return text.strip() if text.strip() else None
     except Exception:
         return None
 
+# =========================
+# Layout tabs
+# =========================
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "① 선수/팀 관리", "② 훈련 세션(플랜·출석)", "③ 영상 분석 노트", "④ 지표 기록(리바운드·참여율)", "⑤ 학부모/리포트"
+])
 
-# -----------------------------
-# Session state: history
-# -----------------------------
-def _init_demo_history() -> List[Dict[str, Any]]:
-    """
-    데모용 6일 샘플 데이터 (오늘 제외).
-    """
-    today = dt.date.today()
-    demo = []
-    # 최근 6일: today-6 ... today-1
-    samples = [
-        (3, 6),  # (checked_count, mood)
-        (4, 7),
-        (2, 5),
-        (5, 8),
-        (3, 6),
-        (4, 7),
-    ]
-    for i, (cc, md) in enumerate(samples, start=6):
-        day = today - dt.timedelta(days=i)
-        rate = round((cc / 5) * 100, 0)
-        demo.append({"date": str(day), "checked": cc, "rate": rate, "mood": md})
-    return demo
+# =========================
+# TAB 1: Players / Team
+# =========================
+with tab1:
+    c1, c2 = st.columns([1, 1])
 
+    with c1:
+        st.subheader("👥 선수 등록")
+        name = st.text_input("선수 이름", placeholder="예: 이원석")
+        grade = st.selectbox("학년/레벨(선택)", ["", "초4", "초5", "초6", "중1", "중2", "중3", "고", "성인/동호회"])
+        position = st.selectbox("포지션(선택)", ["", "G", "F", "C", "G/F", "F/C"])
+        notes = st.text_area("메모(선택)", placeholder="예: 왼손 피니시 약함, 박스아웃 적극적 등")
+        if st.button("선수 추가", type="primary", disabled=not name.strip()):
+            exec_sql(
+                "INSERT INTO players(name, grade, position, notes, created_at) VALUES(?,?,?,?,?)",
+                (name.strip(), grade, position, notes, now_iso())
+            )
+            st.success("선수 추가 완료")
 
-if "history" not in st.session_state:
-    st.session_state.history = _init_demo_history()
+    with c2:
+        st.subheader("📋 선수 목록")
+        pdf = query_df("SELECT * FROM players ORDER BY id DESC")
+        st.dataframe(pdf, use_container_width=True, hide_index=True)
 
-# -----------------------------
-# Check-in UI
-# -----------------------------
-HABITS = [
-    ("🌅", "기상 미션"),
-    ("💧", "물 마시기"),
-    ("📚", "공부/독서"),
-    ("🏋️", "운동하기"),
-    ("😴", "수면"),
-]
+        st.markdown("##### 🧹 선수 삭제(주의)")
+        del_id = st.number_input("삭제할 player id", min_value=0, step=1)
+        if st.button("삭제 실행", disabled=del_id <= 0):
+            exec_sql("DELETE FROM players WHERE id=?", (int(del_id),))
+            st.warning("삭제 완료(연관 데이터는 남아 있을 수 있어요)")
 
-CITIES = [
-    "Seoul",
-    "Busan",
-    "Incheon",
-    "Daegu",
-    "Daejeon",
-    "Gwangju",
-    "Ulsan",
-    "Suwon",
-    "Jeju",
-    "Sejong",
-]
+# =========================
+# TAB 2: Training Session + Attendance + Plan Builder
+# =========================
+with tab2:
+    st.subheader("🗓️ 훈련 세션 생성(플랜 저장)")
+    team = st.text_input("팀/클래스(선택)", placeholder="예: 6학년 B팀")
+    sdate = st.date_input("훈련 날짜", value=dt.date.today())
+    title = st.text_input("세션 제목", placeholder="예: 드리블+피니시+게임")
+    duration = st.number_input("총 시간(분)", min_value=30, max_value=240, value=80, step=5)
+    focus = st.text_input("오늘 핵심 포커스(한 줄)", placeholder="예: 수비 압박 대응 + 피니시 마무리")
 
-coach_col, city_col = st.columns([1, 1])
-with city_col:
-    city = st.selectbox("🌍 도시 선택", CITIES, index=0)
-with coach_col:
-    coach_style = st.radio("🎭 코치 스타일", ["스파르타 코치", "따뜻한 멘토", "게임 마스터"], horizontal=True)
+    st.markdown("##### 🧱 플랜 빌더(드릴을 순서대로 추가)")
+    if "plan_items" not in st.session_state:
+        st.session_state.plan_items = []
 
-st.subheader("✅ 오늘 체크인")
+    pcol1, pcol2, pcol3 = st.columns([2, 1, 1])
+    with pcol1:
+        drill = st.text_input("드릴/메뉴", placeholder="예: 스트레칭/워밍업, 풀코트 수비, 원샷, 투볼 드리블 등")
+    with pcol2:
+        minutes = st.number_input("분", min_value=1, max_value=60, value=8, step=1)
+    with pcol3:
+        intensity = st.selectbox("강도", ["Low", "Mid", "High"], index=1)
 
-c1, c2 = st.columns(2)
+    if st.button("플랜에 추가"):
+        if drill.strip():
+            st.session_state.plan_items.append({"drill": drill.strip(), "min": int(minutes), "intensity": intensity})
+        else:
+            st.info("드릴 이름을 입력해줘")
 
-habit_state: Dict[str, bool] = {}
+    if st.session_state.plan_items:
+        plan_df = pd.DataFrame(st.session_state.plan_items)
+        st.dataframe(plan_df, use_container_width=True, hide_index=True)
+        total_min = int(plan_df["min"].sum())
+        st.caption(f"플랜 합계: {total_min}분 (세션 총 시간 {duration}분과 다르면 조절하면 돼요)")
+        if st.button("플랜 초기화"):
+            st.session_state.plan_items = []
 
-with c1:
-    for emoji, name in HABITS[:3]:
-        habit_state[name] = st.checkbox(f"{emoji} {name}", value=False, key=f"habit_{name}")
+    if st.button("세션 저장", type="primary"):
+        plan_json = json.dumps(st.session_state.plan_items, ensure_ascii=False)
+        sid = exec_sql_return_id(
+            "INSERT INTO sessions(session_date, team, title, duration_min, focus, plan_json, created_at) VALUES(?,?,?,?,?,?,?)",
+            (str(sdate), team, title, int(duration), focus, plan_json, now_iso())
+        )
+        st.success(f"세션 저장 완료 (session_id={sid})")
 
-with c2:
-    for emoji, name in HABITS[3:]:
-        habit_state[name] = st.checkbox(f"{emoji} {name}", value=False, key=f"habit_{name}")
+    st.divider()
+    st.subheader("✅ 출석/컨디션 기록")
 
-mood = st.slider("🙂 오늘 기분(1~10)", min_value=1, max_value=10, value=6, step=1)
+    sdf = query_df("SELECT id, session_date, team, title FROM sessions ORDER BY session_date DESC, id DESC")
+    if sdf.empty:
+        st.info("먼저 세션을 저장해줘.")
+    else:
+        session_label = sdf.apply(lambda r: f"[{r['id']}] {r['session_date']} | {r['team'] or '-'} | {r['title'] or '-'}", axis=1).tolist()
+        session_map = dict(zip(session_label, sdf["id"].tolist()))
+        chosen = st.selectbox("세션 선택", session_label)
+        session_id = int(session_map[chosen])
 
-# -----------------------------
-# Compute today metrics + store in session_state
-# -----------------------------
-checked_count = sum(1 for v in habit_state.values() if v)
-achievement = round((checked_count / 5) * 100, 0)
+        players = query_df("SELECT id, name, grade, position FROM players ORDER BY name ASC")
+        if players.empty:
+            st.info("선수를 먼저 등록해줘.")
+        else:
+            st.markdown("##### 선수별 출석/강도/기분/메모")
+            rows = []
+            for _, r in players.iterrows():
+                pid = int(r["id"])
+                name = r["name"]
+                cols = st.columns([2, 1, 1, 3])
+                with cols[0]:
+                    present = st.checkbox(f"{name}", value=True, key=f"att_{session_id}_{pid}")
+                with cols[1]:
+                    inten = st.slider("강도", 1, 10, 6, key=f"inten_{session_id}_{pid}")
+                with cols[2]:
+                    mood = st.slider("기분", 1, 10, 6, key=f"mood_{session_id}_{pid}")
+                with cols[3]:
+                    memo = st.text_input("메모", key=f"memo_{session_id}_{pid}", placeholder="예: 왼손 마무리 집중 필요")
+                rows.append((session_id, pid, int(present), int(inten), int(mood), memo))
 
-today_str = str(dt.date.today())
-today_row = {"date": today_str, "checked": checked_count, "rate": achievement, "mood": mood}
+            if st.button("출석 기록 저장", type="primary"):
+                for (sid, pid, pres, inten, md, memo) in rows:
+                    exec_sql("""
+                        INSERT INTO attendance(session_id, player_id, present, intensity, mood, memo, created_at)
+                        VALUES(?,?,?,?,?,?,?)
+                        ON CONFLICT(session_id, player_id)
+                        DO UPDATE SET present=excluded.present, intensity=excluded.intensity, mood=excluded.mood, memo=excluded.memo
+                    """, (sid, pid, pres, inten, md, memo, now_iso()))
+                st.success("저장 완료")
 
-# history에 오늘 항목을 "항상 최신"으로 1개 유지
-history: List[Dict[str, Any]] = st.session_state.history
-history = [r for r in history if r.get("date") != today_str]
-history.append(today_row)
-history = sorted(history, key=lambda x: x["date"])
-st.session_state.history = history
+            adf = query_df("""
+                SELECT s.session_date, s.team, s.title, p.name, a.present, a.intensity, a.mood, a.memo
+                FROM attendance a
+                JOIN players p ON p.id=a.player_id
+                JOIN sessions s ON s.id=a.session_id
+                WHERE a.session_id=?
+                ORDER BY p.name ASC
+            """, (session_id,))
+            st.markdown("##### 저장된 출석/컨디션")
+            st.dataframe(adf, use_container_width=True, hide_index=True)
 
-# -----------------------------
-# Metrics + chart
-# -----------------------------
-m1, m2, m3 = st.columns(3)
-m1.metric("달성률", f"{int(achievement)}%")
-m2.metric("달성 습관", f"{checked_count}/5")
-m3.metric("기분", f"{mood}/10")
+# =========================
+# TAB 3: Video analysis notes
+# =========================
+with tab3:
+    st.subheader("🎥 영상 분석 노트(타임스탬프 기반)")
+    ndate = st.date_input("날짜", value=dt.date.today(), key="vn_date")
+    game = st.text_input("경기/영상 이름", placeholder="예: 삼성 vs KT (2/1)")
+    team = st.text_input("팀(선택)", placeholder="예: 삼성")
+    quarter = st.selectbox("쿼터/구간(선택)", ["", "1Q", "2Q", "3Q", "4Q", "연장", "하이라이트", "기타"])
+    timestamp = st.text_input("타임스탬프", placeholder="예: 09:50, 02:00, 08:37")
+    category = st.selectbox("카테고리", ["리바운드", "박스아웃", "수비", "공격", "트랜지션", "턴오버", "기타"])
+    players_text = st.text_input("관련 선수(쉼표로)", placeholder="예: 신동혁, 한호빈")
+    note = st.text_area("노트", placeholder="예: 9분50초 시점 4명이 동시에 오펜리바운드 진입 인상적")
 
-st.subheader("📈 7일 달성률 바 차트")
+    if st.button("영상 노트 저장", type="primary", disabled=not note.strip()):
+        exec_sql("""
+            INSERT INTO video_notes(note_date, game, team, quarter, timestamp, category, players, note, created_at)
+            VALUES(?,?,?,?,?,?,?,?,?)
+        """, (str(ndate), game, team, quarter, timestamp, category, players_text, note.strip(), now_iso()))
+        st.success("저장 완료")
 
-df = pd.DataFrame(st.session_state.history).tail(7)
-if not df.empty:
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date")
-    chart_df = df.set_index("date")[["rate"]]
-    st.bar_chart(chart_df)
-else:
-    st.info("아직 데이터가 없어요. 오늘 체크인을 해보자 ✍️")
+    st.markdown("##### 🔎 검색/필터")
+    f1, f2, f3 = st.columns([1, 1, 2])
+    with f1:
+        q_category = st.selectbox("카테고리 필터", ["전체", "리바운드", "박스아웃", "수비", "공격", "트랜지션", "턴오버", "기타"])
+    with f2:
+        q_team = st.text_input("팀 검색", placeholder="예: 삼성", key="q_team")
+    with f3:
+        q_text = st.text_input("키워드(노트/선수/게임)", placeholder="예: 박스아웃, 9:50, 구탕", key="q_text")
 
-# -----------------------------
-# Generate report button + results
-# -----------------------------
-st.subheader("🧾 AI 코치 리포트")
+    base = "SELECT * FROM video_notes WHERE 1=1"
+    params = []
+    if q_category != "전체":
+        base += " AND category=?"
+        params.append(q_category)
+    if q_team.strip():
+        base += " AND team LIKE ?"
+        params.append(f"%{q_team.strip()}%")
+    if q_text.strip():
+        base += " AND (note LIKE ? OR players LIKE ? OR game LIKE ? OR timestamp LIKE ?)"
+        params += [f"%{q_text.strip()}%"] * 4
+    base += " ORDER BY note_date DESC, id DESC"
 
-btn = st.button("컨디션 리포트 생성", type="primary")
+    vdf = query_df(base, tuple(params))
+    st.dataframe(vdf, use_container_width=True, hide_index=True)
 
-weather_data = None
-dog_data = None
-report_text = None
+# =========================
+# TAB 4: Metrics (Rebound/Participation etc.)
+# =========================
+with tab4:
+    st.subheader("📊 지표 기록(예: 리바운드 참가율, 슈팅 성공률, 참여 퍼센트)")
+    mdate = st.date_input("날짜", value=dt.date.today(), key="m_date")
+    metric_type = st.selectbox("지표 타입", ["리바운드 참가율", "슈팅 성공률", "영상 참여율", "기타"])
+    player = st.text_input("선수", placeholder="예: 이원석")
+    made = st.number_input("성공/참가(분자)", min_value=0, value=0, step=1)
+    attempt = st.number_input("기회(분모)", min_value=0, value=0, step=1)
 
-if btn:
-    with st.spinner("날씨와 강아지를 데려오는 중... 🐾"):
-        weather_data = get_weather(city, owm_api_key)
-        dog_data = get_dog_image()
+    scheme = st.selectbox("등급 기준", ["rebound_total (85/75/65/55)", "alt (82/72/62/52)"])
+    memo = st.text_input("메모(선택)", placeholder="예: 예전 경기보다 참가/박스아웃 좋아짐")
 
-    dog_url, dog_breed = (None, None)
-    if dog_data:
-        dog_url, dog_breed = dog_data
+    percent = None
+    grade = None
+    if attempt > 0:
+        percent = round((made / attempt) * 100, 1)
+        grade = grade_by_percent(percent, "rebound_total" if scheme.startswith("rebound_total") else "alt")
 
-    with st.spinner("AI 코치가 리포트를 쓰는 중... ✍️"):
-        report_text = generate_report(
-            openai_key=openai_api_key,
-            coach_style=coach_style,
-            habits=habit_state,
-            mood=mood,
-            weather=weather_data,
-            dog_breed=dog_breed,
+    st.write(f"계산: {made}/{attempt} = {percent if percent is not None else '-'}% | 등급: {grade or '-'}")
+
+    if st.button("지표 저장", type="primary", disabled=not player.strip()):
+        exec_sql("""
+            INSERT INTO metrics(metric_date, metric_type, player, made, attempt, percent, grade, memo, created_at)
+            VALUES(?,?,?,?,?,?,?,?,?)
+        """, (
+            str(mdate), metric_type, player.strip(),
+            int(made) if attempt > 0 else None,
+            int(attempt) if attempt > 0 else None,
+            float(percent) if percent is not None else None,
+            grade, memo, now_iso()
+        ))
+        st.success("저장 완료")
+
+    st.markdown("##### 📈 최근 30개 기록")
+    mdf = query_df("SELECT * FROM metrics ORDER BY metric_date DESC, id DESC LIMIT 30")
+    st.dataframe(mdf, use_container_width=True, hide_index=True)
+
+    st.markdown("##### 📊 선수별 평균(지표 타입별)")
+    if not mdf.empty:
+        tmp = mdf.dropna(subset=["percent"])
+        if not tmp.empty:
+            pivot = tmp.groupby(["metric_type", "player"], as_index=False)["percent"].mean()
+            st.dataframe(pivot.sort_values(["metric_type", "percent"], ascending=[True, False]),
+                         use_container_width=True, hide_index=True)
+
+# =========================
+# TAB 5: Parent msgs + Reports + Export + AI
+# =========================
+with tab5:
+    st.subheader("💬 학부모/상담 메시지 기록")
+    msg_date = st.date_input("날짜", value=dt.date.today(), key="pm_date")
+    pm_player = st.text_input("선수", placeholder="예: 신동혁", key="pm_player")
+    from_who = st.selectbox("발신(선택)", ["", "부모", "선수", "코치", "기타"])
+    message = st.text_area("메시지", placeholder="예: 최근 수면이 부족한데 운동 병행해도 될까요?")
+
+    if st.button("메시지 저장", type="primary", disabled=not (pm_player.strip() and message.strip())):
+        exec_sql("""
+            INSERT INTO parent_msgs(msg_date, player, from_who, message, created_at)
+            VALUES(?,?,?,?,?)
+        """, (str(msg_date), pm_player.strip(), from_who, message.strip(), now_iso()))
+        st.success("저장 완료")
+
+    pmdf = query_df("SELECT * FROM parent_msgs ORDER BY msg_date DESC, id DESC LIMIT 30")
+    st.dataframe(pmdf, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("🧾 리포트 생성(선택: AI)")
+
+    rcol1, rcol2, rcol3 = st.columns([1, 1, 1])
+    with rcol1:
+        r_player = st.text_input("리포트 대상 선수(선택)", placeholder="비우면 팀 리포트", key="r_player")
+    with rcol2:
+        days = st.number_input("최근 N일", min_value=1, max_value=60, value=7, step=1)
+    with rcol3:
+        tone = st.selectbox("AI 톤", ["coach", "player", "parent"])
+
+    end = dt.date.today()
+    start = end - dt.timedelta(days=int(days))
+
+    # Assemble payload from DB
+    att = query_df("""
+        SELECT s.session_date, s.team, s.title, s.focus, p.name, a.present, a.intensity, a.mood, a.memo
+        FROM attendance a
+        JOIN players p ON p.id=a.player_id
+        JOIN sessions s ON s.id=a.session_id
+        WHERE date(s.session_date) BETWEEN date(?) AND date(?)
+    """, (str(start), str(end)))
+
+    notes = query_df("""
+        SELECT note_date, game, team, quarter, timestamp, category, players, note
+        FROM video_notes
+        WHERE date(note_date) BETWEEN date(?) AND date(?)
+        ORDER BY note_date DESC
+    """, (str(start), str(end)))
+
+    metrics = query_df("""
+        SELECT metric_date, metric_type, player, made, attempt, percent, grade, memo
+        FROM metrics
+        WHERE date(metric_date) BETWEEN date(?) AND date(?)
+        ORDER BY metric_date DESC
+    """, (str(start), str(end)))
+
+    if r_player.strip():
+        att_f = att[att["name"] == r_player.strip()] if not att.empty else att
+        notes_f = notes[notes["players"].fillna("").str.contains(r_player.strip())] if not notes.empty else notes
+        metrics_f = metrics[metrics["player"] == r_player.strip()] if not metrics.empty else metrics
+    else:
+        att_f, notes_f, metrics_f = att, notes, metrics
+
+    payload = {
+        "period": {"start": str(start), "end": str(end)},
+        "mode": app_mode,
+        "target_player": r_player.strip() if r_player.strip() else None,
+        "attendance_summary": att_f.tail(50).to_dict(orient="records") if not att_f.empty else [],
+        "video_notes": notes_f.tail(50).to_dict(orient="records") if not notes_f.empty else [],
+        "metrics": metrics_f.tail(50).to_dict(orient="records") if not metrics_f.empty else [],
+        "request": "최근 기록을 바탕으로 핵심 요약/칭찬/보완/다음 미션을 뽑아줘."
+    }
+
+    left, right = st.columns([1, 1])
+    with left:
+        st.markdown("##### 📌 리포트 원본 데이터(요약)")
+        st.write(f"- 출석/컨디션 rows: {0 if att_f.empty else len(att_f)}")
+        st.write(f"- 영상 노트 rows: {0 if notes_f.empty else len(notes_f)}")
+        st.write(f"- 지표 rows: {0 if metrics_f.empty else len(metrics_f)}")
+        st.code(json.dumps(payload, ensure_ascii=False, indent=2)[:4000], language="json")
+
+    with right:
+        st.markdown("##### 🤖 AI 피드백(선택)")
+        if st.button("AI 피드백 생성", type="primary"):
+            with st.spinner("AI가 코치 노트를 쓰는 중..."):
+                fb = ai_feedback(openai_api_key, payload, tone=tone)
+            if fb:
+                st.markdown(fb)
+                st.markdown("##### 📋 공유용 텍스트")
+                st.code(fb, language="markdown")
+            else:
+                if not openai_api_key:
+                    st.warning("OpenAI API Key가 없어서 AI 기능은 패스했어. (기록/리포트는 계속 사용 가능)")
+                else:
+                    st.error("AI 피드백 생성 실패(키/네트워크/모델 권한 확인)")
+
+    st.divider()
+    st.subheader("⬇️ 내보내기(Export)")
+    ex1, ex2, ex3 = st.columns(3)
+    with ex1:
+        st.download_button(
+            "출석 데이터 CSV",
+            data=att_f.to_csv(index=False).encode("utf-8-sig") if not att_f.empty else "empty".encode(),
+            file_name="attendance.csv",
+            mime="text/csv"
+        )
+    with ex2:
+        st.download_button(
+            "영상 노트 CSV",
+            data=notes_f.to_csv(index=False).encode("utf-8-sig") if not notes_f.empty else "empty".encode(),
+            file_name="video_notes.csv",
+            mime="text/csv"
+        )
+    with ex3:
+        st.download_button(
+            "지표 데이터 CSV",
+            data=metrics_f.to_csv(index=False).encode("utf-8-sig") if not metrics_f.empty else "empty".encode(),
+            file_name="metrics.csv",
+            mime="text/csv"
         )
 
-    # Display: weather + dog cards
-    wcol, dcol = st.columns(2)
-
-    with wcol:
-        st.markdown("#### 🌦️ 오늘의 날씨")
-        if weather_data:
-            top = st.columns([3, 2])
-            with top[0]:
-                st.write(f"**도시:** {weather_data.get('city')}")
-                st.write(f"**상태:** {weather_data.get('desc')}")
-                st.write(f"**기온:** {weather_data.get('temp')}°C (체감 {weather_data.get('feels_like')}°C)")
-                st.write(f"**습도:** {weather_data.get('humidity')}%")
-                if weather_data.get("wind_speed") is not None:
-                    st.write(f"**바람:** {weather_data.get('wind_speed')} m/s")
-            with top[1]:
-                if weather_data.get("icon_url"):
-                    st.image(weather_data["icon_url"], caption="OpenWeatherMap", use_container_width=True)
-        else:
-            st.warning("날씨를 불러오지 못했어요. (API Key/도시/네트워크 확인)")
-
-    with dcol:
-        st.markdown("#### 🐶 오늘의 강아지")
-        if dog_url:
-            st.image(dog_url, use_container_width=True, caption=f"품종: {dog_breed or '알 수 없음'}")
-        else:
-            st.warning("강아지 이미지를 불러오지 못했어요. (네트워크 확인)")
-
-    st.markdown("#### 🧠 AI 리포트")
-    if report_text:
-        st.markdown(report_text)
-    else:
-        if not openai_api_key:
-            st.error("OpenAI API Key를 사이드바에 입력해줘!")
-        else:
-            st.error("리포트를 생성하지 못했어요. (키/요금/네트워크/모델 접근 권한 확인)")
-
-    # Share text
-    st.markdown("#### 📋 공유용 텍스트")
-    share_payload = {
-        "date": today_str,
-        "city": city,
-        "coach_style": coach_style,
-        "achievement": f"{int(achievement)}%",
-        "checked_habits": [k for k, v in habit_state.items() if v],
-        "mood": f"{mood}/10",
-        "weather": weather_data if weather_data else None,
-        "dog_breed": dog_breed,
-        "report": report_text,
-    }
-    st.code(json.dumps(share_payload, ensure_ascii=False, indent=2), language="json")
-
-# -----------------------------
-# API 안내
-# -----------------------------
-with st.expander("🔎 API 안내 / 키 발급 가이드"):
-    st.markdown(
-        """
-- **OpenAI API Key**
-  - OpenAI 대시보드에서 발급한 키를 입력해요.
-  - 배포(예: Streamlit Cloud)에서는 **Secrets**에 저장하는 걸 권장해요.
-
-- **OpenWeatherMap API Key**
-  - OpenWeatherMap에서 발급한 키를 입력해요.
-  - 본 앱은 `현재 날씨(Current Weather)`를 `섭씨(units=metric)` + `한국어(lang=kr)`로 요청해요.
-
-- **Dog CEO**
-  - 키 없이 무료로 랜덤 강아지 이미지를 가져와요. 네트워크가 불안하면 실패할 수 있어요.
-
-문제가 생기면 체크:
-1) API Key 오타/공백 여부  
-2) 네트워크 연결  
-3) 배포 환경에서 Secrets 설정 여부
-        """.strip()
-    )
+    st.caption("팁: Streamlit Cloud에 올릴 땐 DB 파일이 재시작 시 초기화될 수 있어요. 진짜 운영이면 Postgres/Supabase로 바꾸는 게 좋아요.")
